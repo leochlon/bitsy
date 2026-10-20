@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bitsy"
+version = "0.3.0"
+description = "Prompt or weights: gate, bakeoff, diagnose, guard."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+local = ["torch", "transformers"]
+series = ["chronos-forecasting==2.2.2", "transformers>=4.48,<5"]
+
+[tool.setuptools]
+packages = ["bitsy"]
