@@ -41,7 +41,7 @@ The derivations, proofs and experiments are in the paper (see [Citation](../READ
 | `models.py` | Local, Hosted, Azure, Fn |
 | `gate.py` | fit, curves, size, capacity, window |
 | `bakeoff.py` | score, labels, graded, race, pool, paired |
-| `diagnose.py` | value, unused, evidence, spans, items |
+| `diagnose.py` | value, unused, evidence, spans, items; experimental: prior, order, depth, heads, dilution |
 | `guard.py` | check, claims, strict, strict_many |
 | `baselines.py` | Kernel, an in-context field learner |
 | `adapters.py` | Table, Chronos, field, occupancy, ConvONet, depth |

@@ -1,8 +1,10 @@
 """Diagnose: is the information missing, or is the model failing to use it?
 value and unused need observed outcomes; evidence and spans need none; items reports every context item, with or
-without outcomes."""
+without outcomes. When unused finds a decoding loss, prior, order, depth, heads and dilution look for where it lives:
+in the output prior, in position, at some depth, or in the heads that route the context to the answer."""
 import numpy as np
 from .core import ci, d2
+from .models import _is_units
 from . import gate, guard
 
 
@@ -257,3 +259,136 @@ def items(model, context, queries=None, controls=None, groups=(), screen=None, o
         total = _sign(np.concatenate([res[('empty', j)][0] - res[('full', j)][0] for j in keys]), z, tol)[0]
     return dict(items=rows, groups=group_rows, total=total, fits=fits, reads=reads + extra,
                 tokens=tuple(tokens) if tokens[1] else None)
+
+
+# ---- where the decoding loss lives
+#
+# Every readout of a network is a predictor of the answer from the same context, so on held-out queries the difference
+# in code length between two of them is exactly the difference in their decoding losses, in expectation, with no need
+# for the true distribution. Each function below compares two such predictors.
+
+def _longest(model, queries):
+    return max(len(c) + len(a) for c, a in (model._split(q) for q in queries))
+
+
+def _fits(model, units, queries):
+    if hasattr(model, '_split') and not gate.fit(model, list(units), _longest(model, queries))['fits']:
+        raise ValueError('the units must fit the window with the longest query, so that rearranging or deleting units '
+                         'changes nothing else')
+
+
+def prior(prompt, tuned, form, z=1.96):
+    """Is the fine-tune winning on the prior repair or on the content? prompt, tuned, form: bakeoff.score() of the same
+    held-out queries for the prompt (reading the context), a fine-tune on the context, and a fine-tune on a matched
+    control with the same form and irrelevant content (both reading nothing). The form fine-tune can learn only the
+    format and the usual answers, so its advantage over the prompt is a floor on the decoding loss the prompt spends on
+    the prior repair: the model sees the format in its context and does not adopt it. What the full fine-tune adds
+    beyond it comes from the content. Valid when no fine-tune saw the queries and the control says nothing about them.
+    share is the part of the full advantage the form fine-tune reproduces; the reading calls the prior when the floor is
+    above zero and the share is at least half."""
+    a, b, f = (np.asarray(s['cost'], float) for s in (prompt, tuned, form))
+    if a.ndim != 1 or not (a.shape == b.shape == f.shape):
+        raise ValueError('score the same queries for all three')
+    total, rep, content = ci(a - b, z), ci(a - f, z), ci(f - b, z)
+    share = rep[0] / total[0] if total[0] > 0 else None
+    if total[1] <= 0:
+        read = 'no evidence the fine-tune beats the prompt'
+    elif rep[1] > 0 and share is not None and share >= 0.5:
+        read = (f'mostly the prior repair ({share:.0%} of the advantage): the model sees the format in its context and '
+                'does not adopt it. Look at the readout (final norm, output head, an output bias) before the network.')
+    else:
+        read = 'mostly content: the model fails to use what its context says. order(), depth() and heads() look for where.'
+    return dict(total=total, prior=rep, content=content, share=share, floor=max(rep[1], 0.0), read=read)
+
+
+def order(model, context, queries, k=8, seed=0, tuned=None, z=1.96):
+    """Decoding loss from position alone. The prompt reads the units in k random orders, and the average of those k
+    predictions is a reader whose answer cannot depend on the order it was given. Per query its code length is at most
+    the orders' average (Jensen), and on held-out queries the gap is exactly decoding loss that order dependence costs,
+    in expectation. A large cost points at the positional encoding. context: units that fit the window. tuned:
+    bakeoff.score() of a fine-tune on the same queries, to report the share of its advantage over the given order that
+    order alone explains. given_cost compares the order you gave; cost compares a random order."""
+    units, qs = list(context), list(queries)
+    if not _is_units(units) or len(units) < 2:
+        raise ValueError('order needs a context of at least two units')
+    _fits(model, units, qs)
+    rng = np.random.default_rng(seed)
+    perms = [np.arange(len(units))] + [rng.permutation(len(units)) for _ in range(k)]
+    cost = np.array([[b.sum() for b in model.bits([units[i] for i in p], qs)] for p in perms])
+    given, shuffled = cost[0], cost[1:]
+    mix = -(np.logaddexp.reduce(-shuffled * np.log(2), axis=0) - np.log(k)) / np.log(2)
+    out = dict(given=ci(given, z), orders=ci(shuffled.mean(0), z), mixed=ci(mix, z), cost=ci(shuffled.mean(0) - mix, z),
+               given_cost=ci(given - mix, z), k=k, share=None)
+    g = out['given_cost']
+    if tuned is not None:
+        gap = ci(given - np.asarray(tuned['cost'], float), z)
+        out['advantage'] = gap
+        out['share'] = g[0] / gap[0] if gap[0] > 0 else None
+    if g[1] > 0:
+        out['read'] = (f'order alone costs {g[0]:.2f} bits per query (>= {g[1]:.2f}), recovered by averaging over orders'
+                       + (f', {out["share"]:.0%} of the fine-tune\'s advantage' if out['share'] is not None else '')
+                       + ': look at the positional encoding')
+    else:
+        out['read'] = 'no evidence that order costs bits'
+    return out
+
+
+def depth(model, context, queries, train=None, rank=None, epochs=4, lr=1e-3, z=1.96):
+    """Bits by depth: where the context's bits reach the answer, and where they are lost. The answer is read off the
+    residual stream after every layer and scored on these held-out queries; the readouts are trained on `train`,
+    (context, queries) jobs from other documents (a tuned lens; rank keeps each readout low-rank), or, without it, are
+    the logit lens, which needs no training. The difference in code length between the model's own output and the
+    readout after layer k is exactly the decoding loss the layers after k add, in expectation: lost[k] above zero
+    means those layers throw usable bits away. If no readout comes close to a fine-tune's code length, the bits never
+    fully reach the answer positions, which is routing (heads()). depth(tuned, [], ...) gives a fine-tune's curve to
+    compare. Returns bits [layers + 1, queries], the row means, lost per layer and the best layer."""
+    lens = model.lens(train, rank=rank, epochs=epochs, lr=lr) if train is not None else None
+    B = model.depth_bits(context, queries, lens)
+    L = B.shape[0] - 1
+    lost = [ci(B[L] - B[k], z) for k in range(L)]
+    best = int(np.argmin(B[:L].mean(1)))
+    out = dict(bits=B, mean=B.mean(1), layers=[ci(B[k], z) for k in range(L + 1)], lost=lost, best=best,
+               lens='tuned' if lens is not None else 'logit')
+    out['read'] = (f'the readout after layer {best} beats the model\'s own output by {lost[best][0]:.2f} bits per query '
+                   f'(>= {lost[best][1]:.2f}): the layers after it throw usable bits away' if lost[best][1] > 0 else
+                   'no layer\'s readout beats the model\'s own output')
+    return out
+
+
+def heads(model, context, queries, units=None, top=10):
+    """Which attention heads carry each unit's bits to the answer. For each unit tested and each head, the rise in the
+    answer's code length if that head alone lost the unit (attribution patching, Local.routes), next to the measured
+    rise when the unit is deleted outright. units: the indices to test, such as the items diagnose.items marks as
+    evidence; default all. The heads' first-order estimates need not add up to the deletion, which also moves the MLPs
+    and is not linear; heads_sum shows how much they account for. Returns routes [units, layers, heads], exact,
+    heads_sum and the top routes as (unit, layer, head, bits)."""
+    if not hasattr(model, 'routes'):
+        raise ValueError('heads needs a local model (Local)')
+    context = list(context)
+    _fits(model, context, queries)
+    keep = list(range(len(context))) if units is None else [int(u) for u in units]
+    R, exact = model.routes(context, queries, keep)
+    flat = sorted(((keep[u], l, h, float(R[u, l, h])) for u in range(R.shape[0]) for l in range(R.shape[1])
+                   for h in range(R.shape[2])), key=lambda t: -t[3])[:top]
+    read = '; '.join(f'unit {u} through layer {l} head {h}: {b:+.2f} bits' for u, l, h, b in flat[:3])
+    return dict(units=keep, routes=R, exact=exact, heads_sum=R.sum((1, 2)), top=flat, read=read)
+
+
+def dilution(model, contexts, queries, targets, heads=None):
+    """Attention the heads pay to one unit as the context around it changes, such as 8, 16 and 32 passages that all
+    contain it. Softmax attention normalises over the whole context, so every added unit competes for the weight the
+    right one gets; this measures it. contexts: lists of units; targets: the index of the same unit in each; queries:
+    questions that unit answers; heads: (layer, head) pairs to report, such as the top routes from heads(). Needs
+    attention weights: Local(path, attn='eager'). Returns sizes, attention [contexts, layers, heads] (mass on the unit,
+    averaged over query positions and queries) and the prompt's mean bits per query for each context."""
+    if len(contexts) != len(targets):
+        raise ValueError('need the target unit\'s index in every context')
+    qs = list(queries)
+    A = np.array([np.mean([model.attends(list(c), q, t) for q in qs], 0) for c, t in zip(contexts, targets)])
+    out = dict(sizes=[len(c) for c in contexts], attention=A,
+               bits=[float(np.mean([b.sum() for b in model.bits(list(c), qs)])) for c in contexts])
+    if heads:
+        out['heads'] = {(int(l), int(h)): A[:, l, h] for l, h in heads}
+        out['read'] = '; '.join(f'layer {l} head {h}: ' + ' -> '.join(f'{v:.3f}' for v in A[:, l, h]) for l, h in heads) \
+            + f' of the attention on the unit, with {" -> ".join(map(str, out["sizes"]))} units'
+    return out

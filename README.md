@@ -16,7 +16,7 @@ becomes. Each bit is a factor of two. That one measurement answers four question
 - **`gate`**: is a fine-tune worth trying at all?
 
 It works with Hugging Face models on your machine, OpenAI-compatible APIs (OpenAI, Azure, vLLM), and any model you
-wrap that gives a predictive distribution: over text, tables, 3D shapes, cameras or fields. The core is about 1,250
+wrap that gives a predictive distribution: over text, tables, 3D shapes, cameras or fields. The core is about 1,700
 lines of Python and needs only numpy; torch comes in only for models you run locally.
 
 ## Install
@@ -83,7 +83,9 @@ The rule about two digits helps only through its form, so a short template would
 its control, so any second line of that shape makes 17 less likely: GPT-2 is misreading information it has, not
 missing it. Each row also says what to do next, in `r['items'][i]['why']`.
 
-More in [docs/diagnose.md](docs/diagnose.md): items that repeat each other, long contexts, and cost.
+More in [docs/diagnose.md](docs/diagnose.md): items that repeat each other, long contexts, and cost. When a prompt
+fails to use what it reads, [docs/where.md](docs/where.md) (experimental) narrows down where inside the model the
+bits are lost.
 
 ## guard: is the answer supported?
 
@@ -152,6 +154,7 @@ Point predictors, such as most simulation APIs, are wrapped with `laws.spread`. 
 |---|---|---|
 | `items.py` | which context items do the work, mislead, or can be cut | `.[local]` |
 | `language.py` | GPT-2: gate, prompt vs fine-tune, diagnose, guard | `.[local]` |
+| `where.py` | where inside GPT-2 a prompt loses bits (experimental) | `.[local]` |
 | `vitaminc.py` | claims against evidence, on a local or hosted model | a model or an API key |
 | `race.py` | the betting test on simulated streams: wrong calls and speed | numpy |
 | `certificates.py` | certificates on TabPFN, ConvONet and MVSNet: 64 recorded episodes | numpy |
