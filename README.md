@@ -123,7 +123,7 @@ against the prompt's 1.69, but 64 queries are not enough to call it, and the rac
 
 `m.compile` (experimental) is a third contestant. It writes the passage into the late MLP layers in closed form, with
 no gradients, so that the model reading nothing answers as it does with the passage in its prompt. `keep`, other text
-that should stay where it is, is required. In `examples/compile.py`, 64 recall queries drive the solve, 416 more ask
+that should stay where it is, is required. In `examples/install.py`, 64 recall queries drive the solve, 416 more ask
 the same passage from cue positions the solve did not see, and `other` is 512 short passages from elsewhere in the
 play:
 
@@ -175,7 +175,7 @@ Point predictors, such as most simulation APIs, are wrapped with `laws.spread`. 
 |---|---|---|
 | `items.py` | which context items do the work, mislead, or can be cut | `.[local]` |
 | `language.py` | GPT-2: gate, prompt vs fine-tune, diagnose, guard | `.[local]` |
-| `compile.py` | GPT-2: a passage compiled into the weights, against the prompt and for damage to other text | `.[local]` |
+| `install.py` | GPT-2: a passage compiled into the weights, and a fine-tune's change copied into the MLPs where it helps; each scored for damage to other text | `.[local]` |
 | `where.py` | where inside GPT-2 a prompt loses bits (experimental) | `.[local]` |
 | `vitaminc.py` | claims against evidence, on a local or hosted model | a model or an API key |
 | `race.py` | the betting test on simulated streams: wrong calls and speed | numpy |

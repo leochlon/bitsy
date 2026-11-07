@@ -60,7 +60,7 @@ The derivations, proofs and experiments are in the paper (see [Citation](../READ
 - The guard's 0.95 threshold is a default, not a calibration for your data.
 - `Local.compile` is experimental and writes MLP output projections only, in blocks that add them to the residual
   unchanged. Its solve never sees the text it may damage, and how much that text moves depends on how much of it keep
-  covers: in `examples/compile.py`, 16 keep passages left other text 2.3 bits per token worse, 128 left it 0.17 worse.
+  covers: in `examples/install.py`, 16 keep passages left other text 2.3 bits per token worse, 128 left it 0.17 worse.
   Measure it with a margin race.
 - `diagnose.items` needs code lengths or predictions. On chat endpoints without echo, check claims against their
   evidence with `diagnose.spans` and `guard.strict`. Its verdicts need at least `tol` bits per query (0.5 by

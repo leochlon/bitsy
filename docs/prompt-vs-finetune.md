@@ -125,7 +125,7 @@ unchanged.
   against this model for damage. `c.written['relative']` gives each change's norm over its weights' norm; a change
   several times the weights is worth checking for damage first.
 
-`examples/compile.py` writes the passage into GPT-2's last four MLP layers from 64 recall queries, keeps 128 other
+Part 1 of `examples/install.py` writes the passage into GPT-2's last four MLP layers from 64 recall queries, keeps 128 other
 passages of the play in place, and scores 416 queries at cue positions the solve did not see, over the same passage,
 and 512 short passages from elsewhere in the play:
 
