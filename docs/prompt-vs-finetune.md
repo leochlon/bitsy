@@ -140,6 +140,22 @@ other text      8.03 bits/token. Within 0.25 bits/token of the original: yes aft
 The prompt is better, and the compiled model, reading nothing, is within 1 bit per token of it. Other text gets 0.17
 bits per token worse, within the 0.25 tolerance.
 
+Part 2 writes in right answers that no prompt produces. It fine-tunes a copy on 256 passages of the play (one Adam step
+each), puts each block's MLP share of that change alone into the original, and scores it on 128 more right answers and
+on the model's own answers to them. The output projections of the third of the MLPs whose shares help most are then
+solved so that each MLP makes its own share of the fine-tune's change on the training passages and none on 128
+passages the model writes itself. 128 new right answers and 640 more such passages judge it:
+
+```
+fine-tune       right answers -2.042 bits/token against the original, its own answers +2.222
+one MLP         right / own answers, by layer: 0:-0.342/+0.156 ... 5:-0.545/+0.035 ... 11:-0.240/+0.101
+solved          MLPs [3, 4, 5, 6]: new right answers -1.307 bits/token (their shares -1.404, the whole fine-tune -1.877). Better than the original: yes after 92 queries
+text it writes  solved +0.011 bits/token, fine-tune +2.597. Solved within 0.25 of the original: yes after 491 queries
+```
+
+The solved MLPs keep about 70% of the fine-tune's gain on new right answers and move text the model writes by 0.011
+bits per token, where the fine-tune moves it by 2.6.
+
 ## What the model fails to use: diagnose.unused
 
 ```python

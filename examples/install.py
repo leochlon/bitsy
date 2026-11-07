@@ -10,7 +10,7 @@
    the model's own answers to them. The output projections of the third of the MLPs whose shares help most are then
    solved, shallowest first, so that each MLP makes its own share of the fine-tune's change on the 256 training
    passages and none on 128 passages the model writes itself; the fine-tune's attention and other layers are left
-   out. The last 128 right answers, and 384 more passages the model writes, judge the result.
+   out. The last 128 right answers, and 640 more passages the model writes, judge the result.
 
     pip install -e '.[local]'
     python examples/install.py                        # GPT-2 from Hugging Face; any causal LM with --model
@@ -73,7 +73,7 @@ gen = lambda rows, n, **kw: m.lm.generate(T.tensor(rows, device=m.device), atten
     **kw)[:, -n:].tolist()                                           # the mask: begin and pad can be the same token
 own = lambda part: [(q[:8], a) for q, a in zip(part, gen([[m.bos] + list(q[:8]) for q in part], 24, do_sample=False))]
 T.manual_seed(0)
-written = gen([[m.bos]] * 512, 64, do_sample=True, top_k=50)         # text the model writes: 128 kept, 384 judge
+written = gen([[m.bos]] * 768, 64, do_sample=True, top_k=50)         # text the model writes: 128 kept, 640 judge
 tuned = m.copy()
 for i in np.random.default_rng(0).permutation(256):
     tuned.step(list(fit[i]), lr=1e-4)
