@@ -1,8 +1,8 @@
 """Adapters. Language models (Local, Hosted) have: window, V, n(text), bits(context, queries), yes(prompt),
-labels(prompt, names); Local also has copy(), step(text, lr), tune(texts, ...), dist(context, prompts, cands), and, for
-finding where in the network a prompt loses bits: block(), count(), rank_for(), tune_reading(), hidden(), lens(),
-depth_bits(), routes() and attends(). Any other model (Fn) has law(evidence, spec), bits(context, queries) and
-dist(context, specs).
+labels(prompt, names); Local also has copy(), step(text, lr), tune(texts, ...), compile(jobs, keep, ...),
+dist(context, prompts, cands), and, for finding where in the network a prompt loses bits: block(), count(), rank_for(),
+tune_reading(), hidden(), lens(), depth_bits(), routes() and attends(). Any other model (Fn) has law(evidence, spec),
+bits(context, queries) and dist(context, specs).
 
 Text arguments may be strings or token-id lists. A context is a string, a token-id list, or a list
 of units (strings or token-id lists), which are read as separate passages. A query is text, or a pair
@@ -20,6 +20,12 @@ PARTS = ('attn', 'mlp', 'norm', 'embed', 'head')
 _LAYER = re.compile(r'(?:^|\.)(?:layers|h|blocks|layer)\.(\d+)\.')
 _ATTN_OUT = re.compile(r'(?:^|\.)(?:layers|h|blocks|layer)\.(\d+)\.(?:self_attn|attn|attention|self_attention)\.'
                        r'(?:o_proj|c_proj|dense|out_proj)$')
+_MLP_OUT = re.compile(r'(?:^|\.)(?:layers|h|blocks|layer)\.(\d+)\.(?:mlp|ffn|feed_forward)\.'
+                      r'(?:down_proj|c_proj|dense_4h_to_h|fc2|fc_out|w2)$')
+
+
+class _Stop(Exception):
+    """Raised by a hook once the layers a read needs have run."""
 
 
 def _part(name):
@@ -158,6 +164,7 @@ class Local:
     def copy(self):
         m = copy.copy(self)
         m.lm, m._opt = copy.deepcopy(self.lm), None
+        m.__dict__.pop('written', None)
         return m
 
     def _ctx(self, ctx, room, spans=False):
@@ -425,6 +432,141 @@ class Local:
                     (-lp[pos, T.tensor(ans, device=m.device)].sum() / total).backward()
                 opt.step()
         m._merge()
+        return m
+
+    # ---- a context into the weights, in closed form
+
+    def _mlp_outputs(self, only):
+        """(layer, block name, projection name, module) for each selected MLP output projection, shallowest first."""
+        found = []
+        for name, p, mod, attr in self._chosen(only):
+            hit = _MLP_OUT.search(name[:-len('.weight')]) if attr == 'weight' and p.ndim == 2 else None
+            if hit:
+                found.append((int(hit.group(1)), name[:hit.end(1)], name[:-len('.weight')], mod))
+        return sorted(found, key=lambda t: t[0])
+
+    def _read(self, rows, starts, grab, stop):
+        """Read token-id rows as one right-padded batch, stopping after module stop. Per row, what each hook in grab,
+        (module, 'in') for a module's input or (module, 'out') for its output, saw at positions start: onwards."""
+        T, seen = self.T, [None] * len(grab)
+
+        def take(i, where):
+            if where == 'in':
+                def hook(mod, args):
+                    seen[i] = args[0]
+            else:
+                def hook(mod, args, out):
+                    seen[i] = out[0] if isinstance(out, tuple) else out
+            return hook
+
+        def halt(mod, args, out):
+            raise _Stop
+
+        ids = T.full((len(rows), max(map(len, rows))), self.sep, dtype=T.long, device=self.device)
+        mask = T.zeros_like(ids)
+        for r, x in enumerate(rows):
+            ids[r, :len(x)] = T.tensor(x, device=self.device)
+            mask[r, :len(x)] = 1
+        handles = []
+        try:
+            handles = [mod.register_forward_pre_hook(take(i, w)) if w == 'in' else mod.register_forward_hook(take(i, w))
+                       for i, (mod, w) in enumerate(grab)] + [stop.register_forward_hook(halt)]
+            with T.no_grad():
+                self.lm.base_model(input_ids=ids, attention_mask=mask, use_cache=False)
+        except _Stop:
+            pass
+        finally:
+            for h in handles:
+                h.remove()
+        return [[g[r, s:len(x)].float() for g in seen] for r, (x, s) in enumerate(zip(rows, starts))]
+
+    def compile(self, jobs, keep, epochs=1, only=None, rank=None, weight=3.0, ridge=1e-4, batch=8):
+        """Put a context into the weights without gradients. jobs: (context, queries) as in sweep(), or
+        (context, queries, kept), where kept is the part of the context, such as its first units, that stays in the
+        prompt: it is read in both readings, so only the rest goes into the weights. Each query is read with its context
+        by this model and without it by the model being written, from the model's begin token as in bits(), and each
+        selected MLP output projection, shallowest first, is solved in closed form (least squares on its inputs) so
+        that the layer's output without the context moves to its output with it on the query tokens, while keep, texts
+        or token-id lists read with no context, stays where this model puts it. keep is required, and the less of
+        ordinary text it covers, the more ordinary text can move: use hundreds of passages. weight: a query token's
+        weight against one keep token. The first epoch gives each layer an equal share of the gap left to the selected
+        layers from it on; later epochs re-solve each layer for the whole gap left, which fits the queries closer and
+        can move held-out text more: choose epochs on held-out queries. only: as in tune(), e.g. block('mlp',
+        range(16, 28)); only MLP output projections are written, in blocks that add them to the residual unchanged
+        (Llama, Qwen, Mistral, GPT-2, GPT-NeoX). rank bounds each change: after each solve it keeps the rank-r part
+        that carries most of its weighted output (reduced-rank regression). ridge: relative to the mean key energy.
+        batch: rows read at once. Returns a new model whose .written gives the projections changed, the rank applied
+        and each change's norm relative to its weights; this one is unchanged. Score it like a fine-tune, on queries
+        the solve did not see: bakeoff.score(compiled, kept or [], queries) against bakeoff.score(self, context,
+        queries), and other text against this model."""
+        T = self.T
+        keep = list(keep) if _is_units(keep) else [keep]
+        if epochs < 1 or weight <= 0 or ridge <= 0 or batch < 1 or (rank is not None and rank < 1):
+            raise ValueError('need epochs >= 1, weight > 0, ridge > 0, batch >= 1 and rank >= 1')
+        m = self.copy()
+        sites, orig, new = m._mlp_outputs(only), dict(self.lm.named_modules()), dict(m.lm.named_modules())
+        if not sites:
+            raise ValueError("compile writes MLP output projections: select some, e.g. only=block('mlp', range(8, 16))")
+        scaled = getattr(self.lm.config, 'residual_multiplier', 1.0) not in (None, 1, 1.0)
+        normed = any(n.startswith(blk + '.') and ('post_feedforward' in n or 'post_mlp' in n)
+                     for n in new for _, blk, _, _ in sites)
+        if scaled or normed:
+            raise ValueError('compile needs blocks that add the MLP output to the residual unchanged; this model '
+                             'normalises or scales it first')
+
+        with_ids, with_at, wo_ids, wo_at = [], [], [], []
+        for job in jobs:
+            context, qs = job[0], [self._split(q) for q in job[1]]
+            if not qs:
+                continue
+            kept = job[2] if len(job) > 2 else None
+            room = self.window - max(len(c) + len(a) for c, a in qs)
+            a, b = self._ctx(context, room), self._ctx(kept, room)
+            for cue, ans in qs:
+                with_ids.append(a + cue + ans)
+                with_at.append(len(a))
+                wo_ids.append(b + cue + ans)
+                wo_at.append(len(b))
+        if not with_ids:
+            raise ValueError('need at least one query')
+        keep_ids = [[self.bos] + self.enc(t)[:self.window - 1] for t in keep]
+        if all(len(x) < 2 for x in keep_ids):
+            raise ValueError('keep is required: without it nothing holds ordinary text in place')
+        ones = [1] * len(keep_ids)
+
+        changes, applied = {}, None
+        for epoch in range(epochs):
+            for i, (_, blk, name, mod) in enumerate(sites):
+                part = 1.0 / (len(sites) - i) if epoch == 0 else 1.0
+                d_out, d_in = mod.weight.shape[::-1] if type(mod).__name__ == 'Conv1D' else mod.weight.shape
+                G = T.zeros(d_in, d_in, dtype=T.float64, device=self.device)
+                B = T.zeros(d_out, d_in, dtype=T.float64, device=self.device)
+                for target, t_at, current, c_at, wt, p in ((with_ids, with_at, wo_ids, wo_at, weight, part),
+                                                           (keep_ids, ones, keep_ids, ones, 1.0, 1.0)):
+                    for s in range(0, len(target), batch):
+                        goal = self._read(target[s:s + batch], t_at[s:s + batch], [(orig[blk], 'out')], orig[blk])
+                        now = m._read(current[s:s + batch], c_at[s:s + batch], [(mod, 'in'), (new[blk], 'out')],
+                                      new[blk])
+                        for (h_t,), (k, h_c) in zip(goal, now):
+                            k = k.double()
+                            G.addmm_(k.T, k, alpha=wt)
+                            B.addmm_(((h_t - h_c).double() * p).T, k, alpha=wt)
+                A = G.clone()
+                A.diagonal().add_(ridge * float(G.diagonal().mean()))
+                dW = T.cholesky_solve(B.T, T.linalg.cholesky(A)).T
+                if name in changes:
+                    dW += changes[name].double()
+                if rank is not None and rank < min(dW.shape):
+                    U = T.linalg.eigh(dW @ G @ dW.T)[1][:, -rank:]
+                    dW, applied = U @ (U.T @ dW), rank
+                changes[name] = dW.float()
+                with T.no_grad():
+                    W0 = orig[name].weight
+                    mod.weight.copy_((W0.double() + (dW.T if type(mod).__name__ == 'Conv1D' else dW)).to(W0.dtype))
+
+        size = {name: orig[name].weight.detach().double().norm() for name in changes}
+        m.written = dict(projections=[name for _, _, name, _ in sites], rank=applied,
+                         relative={name: float(d.double().norm() / size[name]) for name, d in changes.items()})
         return m
 
     def hidden(self, context, queries):
