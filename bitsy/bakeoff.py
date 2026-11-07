@@ -1,6 +1,9 @@
 """Bakeoff: two memories on one stream of held-out queries; call the better one with error <= alpha.
 'A' means memory A, mixed with eps of the uniform law (at most log2(1/(1-eps)) = 0.015 bits per token at eps = 0.01),
 costs less than B on average over the task's queries; 'B' the reverse. Queries must be drawn independently.
+With a margin m (in cost units per query: bits, or score points for graded), 'A' means A costs less than m more than B
+(A is no worse than B by m or more) and 'B' means A costs more than m more than B: the test for "close enough",
+such as an edit against the prompt it replaces, or damage within a tolerance. margin=0 is the plain comparison.
 The error bound concerns the probability of a wrong call per started stream,
 not the fraction wrong conditional on getting a decision. Budgets may end undecided."""
 import numpy as np
@@ -61,7 +64,14 @@ def graded(s, lo=0.0, hi=1.0):
     return dict(cost=hi - s, mixed=hi - s, c=hi - lo, tokens=np.ones(len(s)))
 
 
-def _d(a, b, idx=None, robust=False):
+def _margin(margin):
+    m = float(margin)
+    if not np.isfinite(m) or m < 0:
+        raise ValueError('margin must be finite and >= 0')
+    return m
+
+
+def _d(a, b, idx=None, robust=False, margin=0.0):
     if a.get('grid') is not None and b.get('grid') is not None and a['grid'] != b['grid']:
         raise ValueError('the two sides use different outcome grids, so their code lengths are not comparable')
     k = 'mixed' if robust else 'cost'
@@ -78,38 +88,48 @@ def _d(a, b, idx=None, robust=False):
         if not np.isfinite(s['c']) or s['c'] <= 0 or (top > s['c'] + 1e-9).any():
             raise ValueError('declared bound must cover every mixed query cost')
     # Betting on A takes B's low end and A's high end, and the reverse for B: the null mean can only fall.
-    da = np.asarray(b[k]) - np.asarray(a.get('mixed_hi', a['mixed']))
-    db = np.asarray(a[k]) - np.asarray(b.get('mixed_hi', b['mixed']))
+    # margin m: A bets E[a - b] < m, B bets E[a - b] > m; B's floor drops to -(c_B + m), passed as its bound
+    m = _margin(margin)
+    da = np.asarray(b[k]) - np.asarray(a.get('mixed_hi', a['mixed'])) + m
+    db = np.asarray(a[k]) - np.asarray(b.get('mixed_hi', b['mixed'])) - m
     return (da[None], db[None]) if idx is None else (da[idx], db[idx])
 
 
-def race(a, b, alpha=0.05, robust=False, population=None):
+def race(a, b, alpha=0.05, robust=False, population=None, margin=0.0):
     """Live: a, b scored on the same queries in arrival order. Returns the call ('A', 'B' or '') and queries used.
     robust=True compares the eps-mixed versions of both memories, which is what you would deploy: an overconfident side
     then cannot lose the call on a few outliers alone. Valid because a mixed code length is non-negative and bounded
     by c.
     population=N targets a fixed finite cohort revealed uniformly without
-    replacement. Its result concerns that cohort, not a wider population."""
+    replacement. Its result concerns that cohort, not a wider population.
+    margin=m (cost units per query, >= 0): 'A' means A costs less than m more than B on average, 'B' that it costs
+    more than m more. Use it when the claim is "no worse than", which a plain race cannot make: an edit within m of the
+    prompt it replaces, or damage to other text within a tolerance (the edit as A, the original as B). Undecided
+    is not a pass."""
     for score_ in (a, b):
         if score_.get('bound_fixed') is False and population != len(score_['cost']):
             raise ValueError('fix L before an independent-stream race; inferred L is only valid for a complete finite cohort')
-    call, stop, _, _ = _race(*_d(a, b, robust=robust), a['c'], b['c'], alpha, population=population)
+    m = _margin(margin)
+    call, stop, _, _ = _race(*_d(a, b, robust=robust, margin=m), a['c'], b['c'] + m, alpha, population=population)
     return dict(call=str(call[0]), queries=int(min(stop[0], len(a['cost']))))
 
 
-def pool(a, b, streams=2000, T=1000, alpha=0.05, seed=0, robust=False):
+def pool(a, b, streams=2000, T=1000, alpha=0.05, seed=0, robust=False, margin=0.0):
     """Offline: query streams drawn at random from a scored pool. How often is each called?
     truth compares the costs being tested (raw, or mixed if robust); wrong counts calls whose own hypothesis is false
     on the pool. With ranges (bakeoff.labels), gap is B's low end minus A's high end, gap_hi the reverse, and truth is
-    '' unless one side wins at both ends."""
+    '' unless one side wins at both ends. margin: as in race(); gap is reported without it, truth and wrong use it.
+    The pool is a resample of the scored queries: its calls estimate how often a race would call, not the answer for
+    the population the queries came from."""
+    m = _margin(margin)
     idx = np.random.default_rng(seed).integers(0, len(a['cost']), size=(streams, T))
-    call, stop, _, _ = _race(*_d(a, b, idx, robust), a['c'], b['c'], alpha)
+    call, stop, _, _ = _race(*_d(a, b, idx, robust, m), a['c'], b['c'] + m, alpha)
     (da,), (db,) = _d(a, b, robust=robust)
     k = 'mixed' if robust else 'cost'
     gap, gap_hi = b[k] - a.get(k + '_hi', a[k]), b.get(k + '_hi', b[k]) - a[k]
     dec = call != ''
-    wrong = ((call == 'A') & (da.mean() <= 0)) | ((call == 'B') & (db.mean() <= 0))
-    out = dict(truth='A' if gap.mean() > 0 else ('B' if gap_hi.mean() < 0 else ''), gap=ci(gap),
+    wrong = ((call == 'A') & (-da.mean() >= m)) | ((call == 'B') & (db.mean() <= m))
+    out = dict(truth='A' if -gap.mean() < m else ('B' if -gap_hi.mean() > m else ''), gap=ci(gap),
                A=int((call == 'A').sum()), B=int((call == 'B').sum()), none=int((~dec).sum()), wrong=int(wrong.sum()),
                median_queries=float(np.median(stop[dec])) if dec.any() else None)
     if any(k + '_hi' in s for s in (a, b)):
@@ -117,9 +137,13 @@ def pool(a, b, streams=2000, T=1000, alpha=0.05, seed=0, robust=False):
     return out
 
 
-def paired(a, b, z=1.96):
+def paired(a, b, z=1.96, margin=0.0):
     """Fixed sample: which of two memories costs less on the same episodes or queries? a, b: their code lengths. The
-    mean of b - a with a normal interval: 'A' if its low end is above zero, 'B' if its high end is below, '' otherwise.
-    Fix the sample size in advance; race() is the test you may stop at any time."""
+    mean of b - a with a normal interval: 'A' if its low end is above -margin, 'B' if its high end is below -margin,
+    '' otherwise. With margin=0 that is "A costs less" / "B costs less"; with margin m > 0 (same units as a and b,
+    such as bits per text), 'A' means A costs less than m more than B: the fixed-sample test for damage within a
+    tolerance. Its normal interval over-calls 'A' when the costs are skewed, such as rare large damage: use race()
+    with the margin there. Fix the sample size in advance; race() is the test you may stop at any time."""
+    g = _margin(margin)
     m, lo, hi = ci(np.asarray(b, float) - np.asarray(a, float), z)
-    return dict(call='A' if lo > 0 else 'B' if hi < 0 else '', diff=m, lo=lo, hi=hi)
+    return dict(call='A' if lo > -g else 'B' if hi < -g else '', diff=m, lo=lo, hi=hi)
