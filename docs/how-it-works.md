@@ -23,7 +23,8 @@ model, with no labels needed.
 - **bakeoff.** A betting test on paired code lengths that can be checked after every query and stopped as soon as it
   calls. A wrong call has probability at most 5% per race, counting runs that end undecided. Queries must be drawn
   independently, or pass `population=N` to test a fixed set shuffled once. Mixing each side with 1% of the uniform
-  distribution bounds every query's cost, which the bets need.
+  distribution bounds every query's cost, which the bets need. With a margin m, the same bets test whether A costs at
+  most m more than B; B's bound grows by m.
 - **diagnose.** Deleting context is held-out validation. A matched deletion, same form with irrelevant content,
   separates what the content adds from what the format does.
 - **guard.** Lifting a claim from probability q to target t takes at least d2(t‖q) bits of evidence, where d2 is the
@@ -38,7 +39,7 @@ The derivations, proofs and experiments are in the paper (see [Citation](../READ
 |---|---|
 | `core.py` | bits, budgets and the betting test |
 | `laws.py` | Bernoulli, Categorical, Gaussian; error spreads for point predictors |
-| `models.py` | Local, Hosted, Azure, Fn |
+| `models.py` | Local (with tune and compile), Hosted, Azure, Fn |
 | `gate.py` | fit, curves, size, capacity, window |
 | `bakeoff.py` | score, labels, graded, race, pool, paired |
 | `diagnose.py` | value, unused, evidence, spans, items; experimental: prior, order, depth, heads, dilution |
@@ -57,6 +58,10 @@ The derivations, proofs and experiments are in the paper (see [Citation](../READ
 - Small differences can stay undecided after thousands of queries. The 5% holds per race, not across many races.
 - `guard.check` on a local instruction model needs transformers < 5. `guard.strict` works with both.
 - The guard's 0.95 threshold is a default, not a calibration for your data.
+- `Local.compile` is experimental and writes MLP output projections only, in blocks that add them to the residual
+  unchanged. Its solve never sees the text it may damage, and how much that text moves depends on how much of it keep
+  covers: in `examples/compile.py`, 16 keep passages left other text 2.3 bits per token worse, 128 left it 0.17 worse.
+  Measure it with a margin race.
 - `diagnose.items` needs code lengths or predictions. On chat endpoints without echo, check claims against their
   evidence with `diagnose.spans` and `guard.strict`. Its verdicts need at least `tol` bits per query (0.5 by
   default) and, over several queries, an interval that excludes zero; an item that matters for one question in

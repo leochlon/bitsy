@@ -25,10 +25,16 @@ from bitsy import Local
 m = Local('gpt2')                                # any Hugging Face causal LM
 m = Local('gpt2', sep='\n', device='cuda')       # one context item per line, on a GPU
 tuned = m.tune(docs, epochs=4)                   # a full fine-tune; returns a new model, m is unchanged
+compiled = m.compile(jobs, keep)                 # a context into the weights, without gradients (experimental)
 ```
 
 `Local` gives exact probabilities, so every tool runs. Context items are joined by the end-of-text token unless `sep`
 names another single token, such as a newline. Install with `pip install -e '.[local]'`.
+
+`compile` takes `(context, queries)` jobs and texts to `keep` in place, and solves the MLP output projections of the
+layers you select so that the model, reading nothing, answers the queries as it does with the context. It returns a
+new model; `compiled.written` lists the projections changed, the rank and each change's norm relative to its weights.
+See [Prompt or fine-tune](prompt-vs-finetune.md#compile-a-context-into-the-weights-without-gradients-experimental).
 
 Text arguments may be strings or token-id lists. A context is a string, a token-id list, or a list of items read as
 separate passages. A query is text, or a pair `(cue, answer)` whose answer alone is scored.

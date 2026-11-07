@@ -1,8 +1,9 @@
-# Prompt or fine-tune: gate and bakeoff
+# Prompt or fine-tune: gate, bakeoff and compile
 
 Should knowledge live in the prompt or in the weights? `gate` tells you whether a fine-tune is worth trying before
 you train one. `bakeoff` compares a prompt and a fine-tune you have built, on the same held-out queries, and stops as
-soon as it is sure which is better.
+soon as it is sure which is better. `Local.compile` (experimental) is a third contestant: it puts a context into the
+weights without gradients, and `bakeoff` scores it like a fine-tune.
 
 The worked example is `examples/language.py`: a 512-token passage of Shakespeare is the knowledge, and 64 recall
 queries each give 8 tokens of it and score the next 24. The prompt reads the passage; the fine-tune is trained on it
@@ -74,6 +75,71 @@ it can be checked after every query and stopped as soon as it calls. A wrong cal
 - **paired** is the fixed-sample version: the mean difference with a normal interval. Fix the sample size in advance;
   `race` is the test you may stop at any time.
 
+## margin: no worse than, within a tolerance
+
+A plain race says which side costs less. A model that replaces the prompt, or an edit that should leave other text
+alone, needs a different claim: no worse than the other side by more than a tolerance. `margin` makes that the test:
+
+```python
+bakeoff.race(b, a, margin=24 * 1.0)              # 'A': b costs less than 1 bit/token more than a; 'B': more
+bakeoff.race(edited, original, margin=32 * 0.25) # on other text: damage within 0.25 bits/token
+```
+
+- With `margin=m`, 'A' means A costs less than m more than B on average, and 'B' means it costs more than m more. Put
+  the new model as A. `margin=0`, the default, is the plain comparison, and its calls are unchanged.
+- m is in cost units per query: bits for `score`, score points for `graded`. A tolerance per token is m divided by the
+  tokens per query, so give the answers one length and multiply.
+- Undecided is not a pass: only 'A' shows the new side is within the tolerance. The 5% bound on a wrong call holds as
+  before.
+- `pool(margin=m)` replays streams with the same two hypotheses. `paired(a, b, margin=m)` is the fixed-sample version.
+
+## compile: a context into the weights, without gradients (experimental)
+
+```python
+c = m.compile([(doc, train)], keep, only=m.block('mlp', 'late'))   # jobs: (context, queries); keep: other text
+a = bakeoff.score(m, doc, held, L=24)            # the prompt, on queries the solve did not see
+b = bakeoff.score(c, [], held, L=24)             # compiled: reads nothing, like a fine-tune
+bakeoff.race(b, a, margin=24 * 1.0)              # within 1 bit/token of the prompt?
+bakeoff.race(bakeoff.score(c, [], other, L=32), bakeoff.score(m, [], other, L=32), margin=32 * 0.25)   # damage
+c.written                                        # the projections changed, the rank, each change's relative size
+```
+
+`compile` reads each query twice: with its context, by this model, and without it, by the model being written. For
+each selected MLP output projection, shallowest first, it solves in closed form (least squares on the projection's
+inputs) for the change that moves the layer's output without the context to its output with it, on the query tokens,
+and writes that change before it reads the next layer. No gradients are taken. It returns a new model; this one is
+unchanged.
+
+- **keep is required**: texts or token-id lists, read with no context, whose layer outputs the solve holds where this
+  model puts them. Without them it moves ordinary text as much as the queries, and the less they cover, the more it
+  moves: in the example, 16 keep passages left other text 2.3 bits per token worse, 128 left it 0.17 worse. Use
+  hundreds. `weight` is a query token's weight against one keep token (3 by default).
+- **only** picks the layers, as in `tune()`; only MLP output projections are written. **rank=r** keeps the rank-r
+  part of each change that carries most of its output. Each **epoch** after the first re-solves every layer for the
+  gap left: it fits the queries more closely and can move held-out text more, so check both.
+- **ridge** is relative to the mean energy of the projection's inputs (1e-4 by default). A larger ridge shrinks each
+  change, and the damage with it, at some cost in recall.
+- A job `(context, queries, kept)` leaves `kept`, the start of the context, in the prompt: the reading without the
+  context reads `kept`, so only the rest goes into the weights. Score that model with `kept` as its context.
+- **Score it like a fine-tune**, on queries the solve did not see: against the prompt with a margin, and on other text
+  against this model for damage. `c.written['relative']` gives each change's norm over its weights' norm; a change
+  several times the weights is worth checking for damage first.
+
+`examples/compile.py` writes the passage into GPT-2's last four MLP layers from 64 recall queries, keeps 128 other
+passages of the play in place, and scores 416 queries at cue positions the solve did not see, over the same passage,
+and 512 short passages from elsewhere in the play:
+
+```
+prompt          recall 1.72 bits/token; the original model, reading nothing, 7.32; other text 7.86
+compile         4 projections written, changes 0.50-4.14 times their weights' norm
+recall          2.47 bits/token. Better than the original: yes after 26 queries
+vs prompt       better: no after 139 queries; within 1 bit/token: yes after 382 queries
+other text      8.03 bits/token. Within 0.25 bits/token of the original: yes after 405 queries
+```
+
+The prompt is better, and the compiled model, reading nothing, is within 1 bit per token of it. Other text gets 0.17
+bits per token worse, within the 0.25 tolerance.
+
 ## What the model fails to use: diagnose.unused
 
 ```python
@@ -102,4 +168,7 @@ gate.curves(k, cases)                            # the support set's learning cu
 - Small differences can stay undecided after thousands of queries.
 - The 5% holds per race, not across many races.
 - `bakeoff.paired` is a fixed-sample test; `race` is the one you may stop early.
+- An undecided margin race is not a pass.
+- `compile` is experimental. It writes MLP output projections only, and its solve sees neither your held-out queries
+  nor the text it may damage: measure both.
 - For the bounds that cover memories you did not build, see [Certificates](certificates.md).

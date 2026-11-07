@@ -12,7 +12,7 @@ becomes. Each bit is a factor of two. That one measurement answers four question
 
 - **`diagnose`**: which parts of my prompt help, which mislead the model, and which do nothing?
 - **`guard`**: is this answer supported by its evidence?
-- **`bakeoff`**: prompt or fine-tune, which is better on my data? It stops as soon as it is sure.
+- **`bakeoff`**: prompt, fine-tune or compiled weights, which is better on my data? It stops as soon as it is sure.
 - **`gate`**: is a fine-tune worth trying at all?
 
 It works with Hugging Face models on your machine, OpenAI-compatible APIs (OpenAI, Azure, vLLM), and any model you
@@ -105,7 +105,7 @@ the evidence is not why. It reads only the first output token, so hosted chat mo
 
 More in [docs/guard.md](docs/guard.md): label ranges on hosted models, grouped claims, and per-site claims.
 
-## bakeoff: prompt or fine-tune?
+## bakeoff: prompt, fine-tune or compile?
 
 In `examples/language.py`, `doc` is a 512-token passage of Shakespeare, and each of 64 `queries` gives 8 tokens of it
 and scores the next 24. The prompt reads the passage; the fine-tune is trained on it and reads nothing:
@@ -120,6 +120,27 @@ bakeoff.race(a, b)
 The prompt is better, and the race called it after 27 of the 64 queries. You can check it after every query and stop
 when it calls; a wrong call has probability at most 5%. After 16 epochs the fine-tune is better, 0.29 bits per token
 against the prompt's 1.69, but 64 queries are not enough to call it, and the race returns `''`, not sure yet.
+
+`m.compile` (experimental) is a third contestant. It writes the passage into the late MLP layers in closed form, with
+no gradients, so that the model reading nothing answers as it does with the passage in its prompt. `keep`, other text
+that should stay where it is, is required. In `examples/compile.py`, 64 recall queries drive the solve, 416 more ask
+the same passage from cue positions the solve did not see, and `other` is 512 short passages from elsewhere in the
+play:
+
+```python
+c = m.compile([(doc, train)], keep, only=m.block('mlp', 'late'))   # a new model; m is unchanged
+a, b = bakeoff.score(m, doc, held, L=24), bakeoff.score(c, [], held, L=24)
+bakeoff.race(b, a, margin=24 * 1.0)                      # 'A': c costs less than 1 bit/token more than the prompt
+# {'call': 'A', 'queries': 382}
+d, e = bakeoff.score(c, [], other, L=32), bakeoff.score(m, [], other, L=32)
+bakeoff.race(d, e, margin=32 * 0.25)                     # 'A': other text within 0.25 bits/token of the original
+# {'call': 'A', 'queries': 405}
+```
+
+A plain race says which side costs less: here the prompt, 1.72 bits per token against 2.47. `margin` asks whether A
+costs less than m more than B, in cost per query, so a tolerance per token is multiplied by the tokens per query. 'B'
+means it costs more than that, and undecided is not a pass. keep decides the damage: with 128 passages other text
+gets 0.17 bits per token worse, with 16 it got 2.3 worse, so check it every time.
 
 ## gate: is a fine-tune worth trying?
 
@@ -140,7 +161,7 @@ for designed data, where a prompt can be shown to beat every memory of a given s
 
 | Model | Runs |
 |---|---|
-| `Local`: Hugging Face weights | everything |
+| `Local`: Hugging Face weights | everything, and `tune` and `compile` to put a context into the weights |
 | `Hosted` with prompt logprobs: vLLM and other echo endpoints | `bakeoff`, `gate.fit`, `diagnose.value`, `diagnose.unused`, `diagnose.items`, `guard` |
 | `Hosted`, `Azure`: OpenAI and Azure chat | `guard.strict`, `diagnose.spans`, `bakeoff.labels` |
 | `Fn`: any model with a predictive distribution | `bakeoff`, `gate.curves`, `gate.size`, `diagnose.evidence`, `diagnose.items`, `guard.claims` |
@@ -154,6 +175,7 @@ Point predictors, such as most simulation APIs, are wrapped with `laws.spread`. 
 |---|---|---|
 | `items.py` | which context items do the work, mislead, or can be cut | `.[local]` |
 | `language.py` | GPT-2: gate, prompt vs fine-tune, diagnose, guard | `.[local]` |
+| `compile.py` | GPT-2: a passage compiled into the weights, against the prompt and for damage to other text | `.[local]` |
 | `where.py` | where inside GPT-2 a prompt loses bits (experimental) | `.[local]` |
 | `vitaminc.py` | claims against evidence, on a local or hosted model | a model or an API key |
 | `race.py` | the betting test on simulated streams: wrong calls and speed | numpy |
@@ -183,6 +205,9 @@ the paper.
   with no logprobs at all, such as Claude's, run only `bakeoff.graded`.
 - The guard's 0.95 threshold is a default, not a calibration for your data.
 - Small differences can stay undecided after thousands of queries, and the 5% error holds per race, not across many.
+  An undecided margin race is not a pass.
+- `compile` is experimental and writes MLP output projections only. Its solve never sees the text it may damage, so
+  measure that with a margin race.
 - Deleting one item at a time misses items that repeat each other; pass `groups` to delete them together.
 - Certificates need the true law of every answer, so they run on designed data only.
 
