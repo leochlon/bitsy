@@ -103,6 +103,10 @@ c = m.compile([(doc, train)], keep, only=m.block('mlp', 'late'))   # train: 64 q
 The weights now hold 87% of what the prompt taught (4.85 of 5.60 bits per token), and other text moved by 0.17. The
 test called it within 1 bit per token of the prompt after 382 questions, and other text within 0.25 after 405.
 
+[notebooks/install_a_skill.ipynb](notebooks/install_a_skill.ipynb) does the same with a 183-token system prompt in
+Qwen2.5-1.5B-Instruct: the edited model, with no prompt, keeps 97% of what the prompt teaches.
+[Open it in Colab](https://colab.research.google.com/github/leochlon/bitsy/blob/main/notebooks/install_a_skill.ipynb).
+
 ## Runs on
 
 - [x] Hugging Face models on your machine (`Local`): everything, including fine-tuning and `compile`
