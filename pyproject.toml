@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bitsy"
 version = "0.4.0"
-description = "Measure, in bits, what a model gets from its context."
+description = "Measure, in bits, how much a model learns from its prompt, a fine-tune or a weight edit."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

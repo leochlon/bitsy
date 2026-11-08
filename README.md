@@ -1,37 +1,42 @@
+<div align="center">
+
 # bitsy
 
-[Paper](#citation) · [Docs](docs/README.md) · [Examples](#examples) · [Licence](LICENSE)
+**How much did your model learn from its prompt, a fine-tune or a weight edit?<br>
+bitsy measures all three in one unit: bits.**
 
-bitsy measures, in bits, what a model gets from its context. It deletes part of the context, asks the model again, and
-measures how much more or less likely the right answer becomes. Each bit is a factor of two. The core is about 1,700
-lines of Python and needs only numpy.
+<h3>
 
-| Tool | What it answers | Start with |
-|---|---|---|
-| [`diagnose`](docs/diagnose.md) | Which parts of my prompt help, which mislead the model, and which do nothing? | `diagnose.items` |
-| [`guard`](docs/guard.md) | Is this answer supported by its evidence? | `guard.strict` |
-| [`bakeoff`](docs/prompt-vs-finetune.md#bakeoff-which-is-better-on-my-data) | Prompt, fine-tune or compiled weights: which is better on my data? It stops as soon as it is sure. | `bakeoff.score`, `bakeoff.race` |
-| [`gate`](docs/prompt-vs-finetune.md#gate-is-a-fine-tune-worth-trying) | Is a fine-tune worth trying at all? | `gate.fit` |
-| [`compile`](docs/prompt-vs-finetune.md#compile-a-context-into-the-weights-without-gradients-experimental) | Experimental: writes a context into a local model's MLP output projections in closed form, with no gradients. `bakeoff` scores it like a fine-tune. | `Local.compile` |
+[Paper](https://arxiv.org/abs/2610.29419) | [Docs](docs/README.md) | [Examples](examples/)
 
-The docs also cover [where a prompt loses bits](docs/where.md) inside a local model (experimental),
-[certificates](docs/certificates.md) on designed data, and [how it works](docs/how-it-works.md).
+</h3>
 
-## Install
+</div>
 
-```bash
-git clone https://github.com/leochlon/bitsy && cd bitsy
-pip install -e .              # numpy only: hosted models and any model you wrap
-pip install -e '.[local]'     # adds torch and transformers, for Hugging Face models on your machine
-pip install -e '.[series]'    # adds Chronos, for the forecasting adapter
-```
+---
 
-Requires Python 3.9+. On Linux, run `pip install torch --index-url https://download.pytorch.org/whl/cpu` first to skip
-the CUDA download.
+Reading something in the prompt and being trained on it are both ways for a model to learn it. bitsy treats every
+prompt, fine-tune, adapter and weight edit as memory and scores it the same way. It takes the model's right answers on
+held-out questions, first with nothing, then with the memory. The bits saved are what the memory taught it: each bit
+makes the right answer twice as likely.
 
-## Quickstart
+- **Attribute it**: how many bits each part of a context contributes, including true lines the model misreads
+  (`diagnose`), and whether an answer's confidence comes from its evidence (`guard`).
+- **Compare memories**: prompt against fine-tune, adapter or edited weights, with a sequential test you can check
+  after every question. It stops when it calls a winner, wrong at most 5% of the time per comparison (`bakeoff`).
+- **Move it**: write a prompt into the weights, solved in closed form with no gradient steps, while holding other text
+  in place, and measure what moved (`compile`).
+- **Find what is lost**: a floor on how much of its prompt a model fails to use, and where inside a local model
+  ([where](docs/where.md)).
+- **Before you train**: whether a fine-tune is worth trying (`gate`), and, on data whose true answers are known, a
+  certificate that a prompt beats every memory of at most C bits, such as any small adapter
+  ([certificates](docs/certificates.md)).
 
-Which passages of a prompt does GPT-2's answer depend on?
+## Try it
+
+### Which lines of its prompt does a model learn from?
+
+Each line is deleted and the answer scored again. A line's value is the bits it saves on the true answer.
 
 ```python
 from bitsy import Local, diagnose
@@ -41,7 +46,7 @@ passages = ['The code for Bob is 17.', 'The code for Alice is 52.', 'The code fo
             'Every code has two digits.', 'Fish swim in the sea.']
 r = diagnose.items(m, passages, [('The code for Bob is', ' 17')])      # a question and its true answer
 for x in r['items']:
-    print(f"{x['value'][0]:+.2f} bits  {x['verdict']:12s}{passages[x['item']]}")
+    print(f"{x['value'][0]:+.2f} bits  {x['verdict']:12s}{passages[x['item']]}")   # [0]: the one question
 ```
 
 ```
@@ -52,33 +57,75 @@ for x in r['items']:
 -0.10 bits  dead weight Fish swim in the sea.
 ```
 
-Each passage is deleted and the prompt read again: the one with the answer makes 17 about 16 times as likely (3.99
-bits), and two true passages make it less likely. The first run downloads GPT-2 (550 MB), and the last digit can differ
-across machines. No torch? `python examples/certificates.py` runs on numpy alone in under a second.
+The line with the answer makes 17 about 16 times as likely. Two true lines cost bits: the verdict is how GPT-2 uses a
+line, not whether it is true. The first run downloads GPT-2 (550 MB); the last digit can vary by machine.
 
-## Models
+### How much does a fine-tune learn, compared with reading?
 
-| Model | Runs |
-|---|---|
-| `Local`: Hugging Face weights | everything, plus `tune` and `compile` |
-| `Hosted` with prompt logprobs: vLLM and other echo endpoints | `bakeoff`, `gate.fit`, `diagnose.value`, `diagnose.unused`, `diagnose.items`, `guard` |
-| `Hosted`, `Azure`: OpenAI and Azure chat | `guard.strict`, `diagnose.spans`, `bakeoff.labels` |
-| `Fn`: any model with a predictive distribution, over text, tables, 3D shapes, cameras or fields | `bakeoff`, `gate.curves`, `gate.size`, `diagnose.evidence`, `diagnose.items`, `guard.claims` |
-| Text only, such as Claude | `bakeoff.graded` |
+A 512-token passage of Shakespeare, either in the prompt or fine-tuned in for one epoch. Each of 64 questions shows 8
+tokens of it and scores the next 24.
 
-Point predictors are wrapped with `laws.spread`. Adapters and more in [docs/models.md](docs/models.md).
+```python
+import numpy as np, urllib.request
+from bitsy import bakeoff
 
-## Examples
+url = 'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt'
+ids = np.array(m.enc(urllib.request.urlopen(url).read().decode()))
+doc = ids[100000:100512]
+queries = [(doc[s:s + 8], doc[s + 8:s + 32]) for s in np.random.default_rng(0).integers(0, 480, 64)]
+none = bakeoff.score(m, [], queries, L=24)                        # L: tokens scored per question, fixed in advance
+a = bakeoff.score(m, doc, queries, L=24)                          # the passage in the prompt
+b = bakeoff.score(m.tune([doc], epochs=1), [], queries, L=24)     # fine-tuned, nothing in the prompt
+print([round(float(s['cost'].mean()) / 24, 2) for s in (none, a, b)])   # bits per token
+# [7.55, 1.69, 6.19]
+bakeoff.race(a, b)                                                # 'A': the first argument is the better memory
+# {'call': 'A', 'queries': 27}
+```
 
-Run any with `python examples/<name>.py`. Each explains its setup at the top and prints one line per result.
+Reading nothing, GPT-2 needs 7.55 bits per token. The prompt saves 5.86 of them, the fine-tune 1.36, and the test was
+sure after 27 of the 64 questions.
 
-- **numpy only:** `race` (the betting test), `certificates` (TabPFN, ConvONet and MVSNet, 64 recorded episodes),
-  `chair` (an occupancy network, live), `shapes` (which points a 3D shape prediction relies on), `camera` (depth for a
-  new view), `fields` (support set vs trained surrogate)
-- **`.[local]`, on GPT-2:** `items` (diagnose), `language` (all four tools), `install` (compile, and a fine-tune's change
-  copied into the MLPs), `where` (experimental)
-- **Other:** `vitaminc` (guard; a model or an API key), `airfrans` (airfoil pressure, support set vs MLP; scikit-learn),
-  `tables` (TabPFN and TabICL vs XGBoost; tabpfn, tabicl, xgboost)
+### The same memory, moved into the weights
+
+[examples/install.py](examples/install.py) writes the passage into GPT-2's last four MLP layers from 64 questions,
+holding 128 other passages in place, then scores 416 new questions with nothing in the prompt. Its core is one call:
+
+```python
+c = m.compile([(doc, train)], keep, only=m.block('mlp', 'late'))   # train: 64 questions; keep: 128 other passages
+```
+
+| | the passage (bits/token) | other text (bits/token) |
+|---|---|---|
+| nothing | 7.32 | 7.86 |
+| the passage in the prompt | 1.72 | |
+| compiled weights, nothing in the prompt | 2.47 | 8.03 |
+
+The weights now hold 87% of what the prompt taught (4.85 of 5.60 bits per token), and other text moved by 0.17. The
+test called it within 1 bit per token of the prompt after 382 questions, and other text within 0.25 after 405.
+
+## Runs on
+
+- [x] Hugging Face models on your machine (`Local`): everything, including fine-tuning and `compile`
+- [x] vLLM and other servers that return prompt log-probabilities (`Hosted`): `bakeoff`, `gate.fit`, `guard`,
+  `diagnose.value`, `diagnose.unused`, `diagnose.items`
+- [x] OpenAI and Azure chat (`Hosted`, `Azure`): `guard.strict`, `diagnose.spans`, `bakeoff.labels`
+- [x] Any model that outputs a probability distribution (`Fn`): tables, 3D shapes, cameras, physics fields
+- [x] Text-only APIs such as Claude: `bakeoff.graded` on scored answers
+
+Details, and adapters for sklearn-style classifiers such as TabPFN, Chronos forecasts and 3D models, in
+[docs/models.md](docs/models.md).
+
+## Install
+
+```bash
+git clone https://github.com/leochlon/bitsy && cd bitsy
+pip install -e .              # numpy only: hosted models and any model you wrap
+pip install -e '.[local]'     # adds torch and transformers, for Hugging Face models on your machine
+pip install -e '.[series]'    # adds Chronos, for time series
+```
+
+Python 3.9+. On Linux, `pip install torch --index-url https://download.pytorch.org/whl/cpu` first skips the CUDA
+download. `python examples/certificates.py` runs on numpy alone in under a second.
 
 ## Citation
 
@@ -91,7 +138,6 @@ Run any with `python examples/<name>.py`. Each explains its setup at the top and
 }
 ```
 
-## Licence
-
-[MIT](LICENSE). `examples/data/airfrans-pressure64.npz` holds 1,000 AirfRANS simulations (Bonnet et al., NeurIPS
-2022), each reduced to 18 design inputs and 64 surface pressure coefficients, under the Open Database Licence 1.0.
+[MIT licence](LICENSE). `examples/data/airfrans-pressure64.npz` holds 1,000 AirfRANS simulations (Bonnet et al.,
+NeurIPS 2022), each reduced to 18 design inputs and 64 surface pressure coefficients, under the Open Database Licence
+1.0.
